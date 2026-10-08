@@ -133,11 +133,30 @@ class _Iterator(_Iterable[_T_co], Iterator[_T_co], Generic[_T_co]):
         wrapped: Iterator[_T_co],
         callback: Optional[_CallbackT[_AnyT]] = None,
         context_manager_factory: Optional[Callable[[], ContextManager[Any]]] = None,
+        on_abandon: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(wrapped, callback, context_manager_factory)
+        self._self_on_abandon = _no_err(on_abandon) if on_abandon is not None else None
 
     def __next__(self) -> _T_co:
         return cast(_T_co, _call(self))
+
+    def close(self) -> None:
+        try:
+            close = getattr(self.__wrapped__, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._finish_on_abandon()
+
+    def __del__(self) -> None:
+        self._finish_on_abandon()
+
+    def _finish_on_abandon(self) -> None:
+        on_abandon = getattr(self, "_self_on_abandon", None)
+        if on_abandon is not None:
+            self._self_on_abandon = None
+            on_abandon()
 
 
 class _Generator(

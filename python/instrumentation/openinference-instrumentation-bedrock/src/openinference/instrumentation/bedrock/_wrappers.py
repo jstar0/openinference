@@ -396,6 +396,7 @@ class _InvokeModelWithResponseStream(_WithTracer):
                     response["body"],
                     _AnthropicMessagesCallback(span, parsed_request),
                     _use_span(span),
+                    on_close=span.end,
                 )
                 return response
             model_id = str(kwargs.get("modelId", ""))
@@ -405,6 +406,7 @@ class _InvokeModelWithResponseStream(_WithTracer):
                     response["body"],
                     _NovaStreamCallback(span, parsed_request),
                     _use_span(span),
+                    on_close=span.end,
                 )
                 return response
             if "openai." in model_id:
@@ -413,6 +415,7 @@ class _InvokeModelWithResponseStream(_WithTracer):
                     response["body"],
                     _OpenAIStreamCallback(span),
                     _use_span(span),
+                    on_close=span.end,
                 )
                 return response
         span.set_attribute(LLM_INVOCATION_PARAMETERS, safe_json_dumps(body))
@@ -507,6 +510,7 @@ class _ConverseStream(_WithTracer):
                 response["stream"],
                 _ConverseStreamCallback(span, cast("ConverseStreamRequestTypeDef", kwargs)),
                 _use_span(span),
+                on_close=span.end,
             )
             return response
         span.set_attribute(OPENINFERENCE_SPAN_KIND, LLM)

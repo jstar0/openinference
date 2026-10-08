@@ -1,6 +1,10 @@
+import asyncio
 import base64
+import gc
 import io
 import json
+import struct
+import zlib
 from typing import Any, Dict, Generator, List, Tuple
 from unittest.mock import MagicMock
 
@@ -24,6 +28,7 @@ from openinference.instrumentation.bedrock import (
 from openinference.instrumentation.bedrock._converse_attributes import (
     get_attributes_from_response_data,
 )
+from openinference.instrumentation.bedrock.utils import _EventStream
 from openinference.instrumentation.bedrock.utils._extract_invoke_model_attributes import (
     _extract_finish_reason,
 )
@@ -33,6 +38,47 @@ from openinference.semconv.trace import (
     OpenInferenceSpanKindValues,
     SpanAttributes,
 )
+
+
+def _event_stream_frame(event_type: str, payload: Dict[str, Any]) -> bytes:
+    def header(name: str, value: str) -> bytes:
+        name_bytes = name.encode()
+        value_bytes = value.encode()
+        return (
+            struct.pack("B", len(name_bytes))
+            + name_bytes
+            + b"\x07"
+            + struct.pack(">H", len(value_bytes))
+            + value_bytes
+        )
+
+    headers = (
+        header(":event-type", event_type)
+        + header(":content-type", "application/json")
+        + header(":message-type", "event")
+    )
+    body = json.dumps(payload).encode()
+    prelude = struct.pack(">II", 12 + len(headers) + len(body) + 4, len(headers))
+    prelude += struct.pack(">I", zlib.crc32(prelude))
+    message = prelude + headers + body
+    return message + struct.pack(">I", zlib.crc32(message))
+
+
+class _EventStreamRaw:
+    def __init__(self, frames: List[bytes]) -> None:
+        self.frames = frames
+
+    def stream(self, *args: Any, **kwargs: Any) -> Any:
+        yield from self.frames
+
+    def read(self, amt: Any = None) -> bytes:
+        data = b"".join(self.frames)
+        return data if amt is None else data[:amt]
+
+    def close(self) -> None:
+        pass
+
+    release_conn = close
 
 
 @pytest.fixture()
@@ -1140,3 +1186,205 @@ def test_uninstrument_stops_spans_on_existing_clients(
     wrapped_converse(modelId=model_id, messages=[message])
 
     BedrockInstrumentor().instrument(tracer_provider=tracer_provider)
+
+
+@pytest.mark.parametrize("api", ["converse_stream", "invoke_model_with_response_stream"])
+@pytest.mark.parametrize("exit_mode", ["break", "close", "abandon"])
+def test_bedrock_stream_ends_span_on_early_exit(
+    api: str,
+    exit_mode: str,
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    if api == "converse_stream" and boto3.__version__ < _MINIMUM_CONVERSE_BOTOCORE_VERSION:
+        pytest.xfail(
+            f"Botocore {boto3.__version__} does not support the Converse API. "
+            f"Converse API introduced in {_MINIMUM_CONVERSE_BOTOCORE_VERSION}"
+        )
+
+    model_id = "anthropic.claude-3-haiku-20240307-v1:0"
+    converse_frames = [
+        _event_stream_frame("messageStart", {"role": "assistant"}),
+        _event_stream_frame(
+            "contentBlockDelta",
+            {"contentBlockIndex": 0, "delta": {"text": "partial"}},
+        ),
+    ]
+    invoke_events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "m",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": [],
+                "usage": {"input_tokens": 3, "output_tokens": 0},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "partial"},
+        },
+    ]
+    invoke_frames = [
+        _event_stream_frame(
+            "chunk",
+            {"bytes": base64.b64encode(json.dumps(event).encode()).decode()},
+        )
+        for event in invoke_events
+    ]
+
+    def before_send(request: Any, **kwargs: Any) -> AWSResponse:
+        frames = converse_frames if request.url.endswith("/converse-stream") else invoke_frames
+        return AWSResponse(
+            request.url,
+            200,
+            {"content-type": "application/vnd.amazon.eventstream"},
+            _EventStreamRaw(frames),
+        )
+
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+        config=Config(retries={"total_max_attempts": 1}),
+    )
+    client.meta.events.register("before-send.bedrock-runtime.*", before_send)
+    if api == "converse_stream":
+        response = client.converse_stream(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": "hi"}]}],
+        )
+        stream = response["stream"]
+    else:
+        body = json.dumps(
+            {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            }
+        )
+        response = client.invoke_model_with_response_stream(modelId=model_id, body=body)
+        stream = response["body"]
+
+    if exit_mode == "break":
+        for _ in stream:
+            break
+    elif exit_mode == "close":
+        iterator = iter(stream)
+        next(iterator)
+        stream.close()
+        del iterator
+    else:
+        del stream
+        del response
+
+    gc.collect()
+    (span,) = in_memory_span_exporter.get_finished_spans()
+    assert span.status.status_code == trace_api.StatusCode.UNSET
+
+
+def test_event_stream_close_and_abandon_finalize_once() -> None:
+    class _FakeEventStream:
+        def __iter__(self) -> Any:
+            return iter(("first", "second"))
+
+        def close(self) -> None:
+            pass
+
+    closed = []
+    stream = _EventStream(
+        _FakeEventStream(),
+        callback=lambda value: value,
+        on_close=lambda: closed.append("closed"),
+    )
+    iterator = iter(stream)
+    assert next(iterator) == "first"
+
+    stream.close()
+    close = getattr(iterator, "close", None)
+    assert callable(close)
+    close()
+    del iterator
+    del stream
+    gc.collect()
+
+    assert closed == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_async_event_stream_finishes_when_iteration_is_abandoned() -> None:
+    class _FakeAsyncEventStream:
+        def __init__(self) -> None:
+            self._events = iter(("first", "second"))
+
+        def __aiter__(self) -> "_FakeAsyncEventStream":
+            return self
+
+        async def __anext__(self) -> str:
+            try:
+                return next(self._events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def aclose(self) -> None:
+            pass
+
+    closed = []
+    stream = _EventStream(
+        _FakeAsyncEventStream(),
+        callback=lambda value: value,
+        on_close=lambda: closed.append("closed"),
+    )
+    async for _ in stream:
+        break
+    gc.collect()
+
+    assert closed == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_async_event_stream_aclose_finalizes_once() -> None:
+    class _FakeAsyncEventStream:
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+        def __aiter__(self) -> "_FakeAsyncEventStream":
+            return self
+
+        async def aclose(self) -> None:
+            pass
+
+    closed = []
+    stream = _EventStream(
+        _FakeAsyncEventStream(),
+        on_close=lambda: closed.append("closed"),
+    )
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert closed == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_async_event_stream_finalizes_on_cancellation() -> None:
+    class _FakeAsyncEventStream:
+        def __aiter__(self) -> "_FakeAsyncEventStream":
+            return self
+
+        async def __anext__(self) -> str:
+            raise asyncio.CancelledError
+
+    closed = []
+    stream = _EventStream(
+        _FakeAsyncEventStream(),
+        on_close=lambda: closed.append("closed"),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream.__aiter__().__anext__()
+
+    assert closed == ["closed"]
